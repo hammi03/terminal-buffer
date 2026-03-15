@@ -5,8 +5,8 @@ package com.terminal
  * Captured as a snapshot into each [Cell] at write time.
  */
 data class TextAttributes(
-    val fg: Int = 0,
-    val bg: Int = 0,
+    val fg: Color = Color.DEFAULT,
+    val bg: Color = Color.DEFAULT,
     val bold: Boolean = false,
     val italic: Boolean = false,
     val underline: Boolean = false,
