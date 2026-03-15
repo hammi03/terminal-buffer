@@ -77,7 +77,14 @@ class TerminalBuffer(
      * Each character is inserted at the current cursor position; existing
      * content on the current line shifts right by one. The cell pushed off the
      * right edge cascades to column 0 of the next line, propagating all the way
-     * to the bottom. Overflow past the last line is discarded.
+     * to the bottom of the visible screen.
+     *
+     * **Overflow policy:** content that would be pushed past the last row of the
+     * visible screen is silently discarded. Insert mode does not trigger a scroll;
+     * only cursor advancement past the last row (as in [writeText]) does.
+     * This matches the behaviour of classic terminal insert mode (e.g. VT100 ICH),
+     * where inserted characters shift within the current page and excess is lost.
+     *
      * The cursor advances exactly as in [writeText].
      */
     fun insertText(text: String) {
@@ -128,7 +135,7 @@ class TerminalBuffer(
         scrollback.clear()
     }
 
-    // ── Read operations ───────────────────────────────────────────────────────
+    // ── Read — visible screen ─────────────────────────────────────────────────
 
     /** Return the [Cell] at screen position ([row], [col]). */
     fun readCell(row: Int, col: Int): Cell = screen[row][col]
@@ -139,6 +146,52 @@ class TerminalBuffer(
     /** Return the full visible screen as a newline-separated string. */
     fun readScreen(): String = screen.joinToString("\n") { it.asString() }
 
+    // ── Read — scrollback ─────────────────────────────────────────────────────
+
+    /** Number of lines currently stored in scrollback. */
+    fun scrollbackSize(): Int = scrollback.size
+
+    /**
+     * Return the [Cell] at scrollback row [row] and [col].
+     * Row 0 is the oldest (topmost) scrolled-off line.
+     */
+    fun readScrollbackCell(row: Int, col: Int): Cell = scrollback[row][col]
+
+    /** Return scrollback row [row] as a plain string. Row 0 is the oldest line. */
+    fun readScrollbackLine(row: Int): String = scrollback[row].asString()
+
+    // ── Read — global coordinate space (scrollback + screen) ─────────────────
+
+    /**
+     * Total logical lines: scrollback rows followed by visible screen rows.
+     * Global row 0 is the oldest scrollback line; global row [totalLines]-1
+     * is the bottom of the visible screen.
+     */
+    val totalLines: Int get() = scrollback.size + height
+
+    /**
+     * Return the [Cell] at the given global row and [col].
+     * Global rows 0..[scrollbackSize)-1 address scrollback;
+     * rows [scrollbackSize]..[totalLines)-1 address the visible screen.
+     */
+    fun readGlobalCell(globalRow: Int, col: Int): Cell {
+        val sbSize = scrollback.size
+        return if (globalRow < sbSize) scrollback[globalRow][col]
+               else screen[globalRow - sbSize][col]
+    }
+
+    /**
+     * Return the global row at [globalRow] as a plain string.
+     * Uses the same indexing as [readGlobalCell].
+     */
+    fun readGlobalLine(globalRow: Int): String {
+        val sbSize = scrollback.size
+        return if (globalRow < sbSize) scrollback[globalRow].asString()
+               else screen[globalRow - sbSize].asString()
+    }
+
+    // ── Read — full history ───────────────────────────────────────────────────
+
     /**
      * Return scrollback followed by the visible screen as a single
      * newline-separated string. The oldest scrollback line is first.
@@ -147,9 +200,6 @@ class TerminalBuffer(
         scrollback.forEach { append(it.asString()).append('\n') }
         append(readScreen())
     }
-
-    /** Number of lines currently stored in scrollback. */
-    fun scrollbackSize(): Int = scrollback.size
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
