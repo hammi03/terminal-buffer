@@ -13,18 +13,25 @@ package com.terminal
  * @param maxScrollback maximum lines retained in scrollback history (0 = disabled)
  */
 class TerminalBuffer(
-    val width: Int,
-    val height: Int,
+    width: Int,
+    height: Int,
     val maxScrollback: Int = 1000,
 ) {
     init {
-        require(width > 0)        { "width must be > 0" }
-        require(height > 0)       { "height must be > 0" }
+        require(width > 0)          { "width must be > 0" }
+        require(height > 0)         { "height must be > 0" }
         require(maxScrollback >= 0) { "maxScrollback must be >= 0" }
     }
 
+    // Backing fields — mutable to support resize().
+    private var _width:  Int = width
+    private var _height: Int = height
+
+    val width:  Int get() = _width
+    val height: Int get() = _height
+
     // Visible screen — screen[0] is the top row.
-    private val screen: Array<Line> = Array(height) { Line(width) }
+    private var screen: Array<Line> = Array(height) { Line(width) }
 
     // Scrollback — index 0 is the oldest (topmost) scrolled-off line.
     private val scrollback: ArrayDeque<Line> = ArrayDeque()
@@ -47,8 +54,8 @@ class TerminalBuffer(
 
     /** Move cursor to (row, col), clamped to valid bounds. */
     fun setCursor(row: Int, col: Int) {
-        cursorRow = row.coerceIn(0, height - 1)
-        cursorCol = col.coerceIn(0, width - 1)
+        cursorRow = row.coerceIn(0, _height - 1)
+        cursorCol = col.coerceIn(0, _width - 1)
     }
 
     /** Move cursor by (dRow, dCol), clamped to valid bounds. */
@@ -58,15 +65,29 @@ class TerminalBuffer(
 
     /**
      * Write [text] at the cursor in overwrite mode.
-     * Each character replaces the cell at the current cursor position.
-     * The cursor advances after each character; at the end of a line it wraps
-     * to column 0 of the next line. At the bottom of the screen the buffer
-     * scrolls up one line.
+     * Each character replaces the cell(s) at the current cursor position.
+     * Wide characters occupy two columns; if a wide character does not fit
+     * in the last column of a line the final column is filled with a blank
+     * and the wide character is written at the start of the next line.
+     * The cursor advances after each character (by 2 for wide characters).
+     * At the bottom of the screen the buffer scrolls up one line.
      */
     fun writeText(text: String) {
         for (ch in text) {
+            val w = CharWidth.of(ch)
+            if (w == 2 && cursorCol == _width - 1) {
+                // Wide char won't fit — blank last column and wrap.
+                clearWideRemnants(cursorRow, cursorCol)
+                screen[cursorRow][cursorCol] = Cell.BLANK
+                advanceCursor()
+            }
+            clearWideRemnants(cursorRow, cursorCol)
             screen[cursorRow][cursorCol] = Cell.of(ch, currentAttributes)
-            advanceCursor()
+            if (w == 2) {
+                clearWideRemnants(cursorRow, cursorCol + 1)
+                screen[cursorRow][cursorCol + 1] = Cell.CONTINUATION
+            }
+            advanceCursor(w)
         }
     }
 
@@ -75,26 +96,28 @@ class TerminalBuffer(
     /**
      * Insert [text] at the cursor in insert mode.
      * Each character is inserted at the current cursor position; existing
-     * content on the current line shifts right by one. The cell pushed off the
-     * right edge cascades to column 0 of the next line, propagating all the way
-     * to the bottom of the visible screen.
-     *
-     * **Overflow policy:** content that would be pushed past the last row of the
-     * visible screen is silently discarded. Insert mode does not trigger a scroll;
-     * only cursor advancement past the last row (as in [writeText]) does.
-     * This matches the behaviour of classic terminal insert mode (e.g. VT100 ICH),
-     * where inserted characters shift within the current page and excess is lost.
-     *
+     * content on the current line shifts right.  Wide characters consume two
+     * columns and are inserted as a LEAD + CONTINUATION pair.
+     * Overflow cascades to subsequent lines; content pushed past the last row
+     * is discarded (see README for rationale).
      * The cursor advances exactly as in [writeText].
      */
     fun insertText(text: String) {
         for (ch in text) {
-            var overflow: Cell = screen[cursorRow].insertAt(cursorCol, Cell.of(ch, currentAttributes))
-            for (row in cursorRow + 1 until height) {
-                overflow = screen[row].insertAt(0, overflow)
+            val w = CharWidth.of(ch)
+            if (w == 2 && cursorCol >= _width - 1) {
+                // Wide char won't fit — insert blank at current pos and wrap.
+                var ov: Cell = screen[cursorRow].insertAt(cursorCol, Cell.BLANK)
+                for (row in cursorRow + 1 until _height) ov = screen[row].insertAt(0, ov)
+                advanceCursor()
             }
-            // overflow past the last line is discarded
-            advanceCursor()
+            var overflow: Cell = screen[cursorRow].insertAt(cursorCol, Cell.of(ch, currentAttributes))
+            for (row in cursorRow + 1 until _height) overflow = screen[row].insertAt(0, overflow)
+            if (w == 2) {
+                var ov2: Cell = screen[cursorRow].insertAt(cursorCol + 1, Cell.CONTINUATION)
+                for (row in cursorRow + 1 until _height) ov2 = screen[row].insertAt(0, ov2)
+            }
+            advanceCursor(w)
         }
     }
 
@@ -105,7 +128,7 @@ class TerminalBuffer(
      * [row] is clamped to valid bounds.
      */
     fun fillLine(row: Int, char: Char = ' ') {
-        screen[row.coerceIn(0, height - 1)].fill(Cell.of(char, currentAttributes))
+        screen[row.coerceIn(0, _height - 1)].fill(Cell.of(char, currentAttributes))
     }
 
     /**
@@ -121,7 +144,7 @@ class TerminalBuffer(
      * to (0, 0). Scrollback is preserved.
      */
     fun clearScreen() {
-        for (i in screen.indices) screen[i] = Line(width)
+        screen = Array(_height) { Line(_width) }
         cursorRow = 0
         cursorCol = 0
     }
@@ -133,6 +156,72 @@ class TerminalBuffer(
     fun clearAll() {
         clearScreen()
         scrollback.clear()
+    }
+
+    // ── Resize ────────────────────────────────────────────────────────────────
+
+    /**
+     * Change the buffer dimensions to [newWidth] × [newHeight].
+     *
+     * **Width change**
+     * Each line (screen and scrollback) is resized:
+     * - Growing: blank cells are appended on the right.
+     * - Shrinking: cells beyond the new width are discarded.
+     * Wide characters that straddle the new right edge may become orphaned;
+     * this is noted as a known limitation (see README).
+     *
+     * **Height change**
+     * - Shrinking: the top `oldHeight − newHeight` screen rows are pushed into
+     *   scrollback (subject to [maxScrollback]) before the screen is trimmed.
+     *   This preserves content as history, mirroring normal scroll behaviour.
+     * - Growing: blank rows are appended at the bottom of the visible screen.
+     *
+     * The cursor is clamped to the new bounds after resize.
+     */
+    fun resize(newWidth: Int, newHeight: Int) {
+        require(newWidth  > 0) { "newWidth must be > 0" }
+        require(newHeight > 0) { "newHeight must be > 0" }
+
+        val oldWidth  = _width
+        val oldHeight = _height
+
+        // ── Width ─────────────────────────────────────────────────────────────
+        if (newWidth != oldWidth) {
+            fun resizeLine(old: Line): Line {
+                val newLine = Line(newWidth)
+                val copy = minOf(oldWidth, newWidth)
+                for (col in 0 until copy) newLine[col] = old[col]
+                return newLine
+            }
+            for (i in screen.indices) screen[i] = resizeLine(screen[i])
+            val resized = scrollback.map { resizeLine(it) }
+            scrollback.clear()
+            resized.forEach { scrollback.addLast(it) }
+            _width = newWidth
+        }
+
+        // ── Height ────────────────────────────────────────────────────────────
+        if (newHeight < oldHeight) {
+            // Shrink: push top rows into scrollback, keep the bottom rows.
+            val rowsToPush = oldHeight - newHeight
+            for (i in 0 until rowsToPush) {
+                if (maxScrollback > 0) {
+                    if (scrollback.size >= maxScrollback) scrollback.removeFirst()
+                    scrollback.addLast(screen[i])
+                }
+            }
+            screen = Array(newHeight) { i -> screen[i + rowsToPush] }
+        } else if (newHeight > oldHeight) {
+            // Grow: append blank rows at the bottom.
+            screen = Array(newHeight) { i ->
+                if (i < oldHeight) screen[i] else Line(_width)
+            }
+        }
+        _height = newHeight
+
+        // Cursor must stay in bounds after resize.
+        cursorRow = cursorRow.coerceIn(0, _height - 1)
+        cursorCol = cursorCol.coerceIn(0, _width - 1)
     }
 
     // ── Read — visible screen ─────────────────────────────────────────────────
@@ -167,7 +256,7 @@ class TerminalBuffer(
      * Global row 0 is the oldest scrollback line; global row [totalLines]-1
      * is the bottom of the visible screen.
      */
-    val totalLines: Int get() = scrollback.size + height
+    val totalLines: Int get() = scrollback.size + _height
 
     /**
      * Return the [Cell] at the given global row and [col].
@@ -204,17 +293,31 @@ class TerminalBuffer(
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     /**
-     * Advance the cursor by one cell. Wraps to the next line at the right edge;
-     * scrolls the screen up when the cursor moves past the last row.
+     * Clear any wide-character remnants at (row, col) before writing there.
+     * - If (row, col) holds a CONTINUATION, blank the LEAD cell to its left.
+     * - If (row, col) holds a LEAD, blank the CONTINUATION cell to its right.
      */
-    private fun advanceCursor() {
-        cursorCol++
-        if (cursorCol >= width) {
-            cursorCol = 0
+    private fun clearWideRemnants(row: Int, col: Int) {
+        val cell = screen[row][col]
+        if (cell.isContinuation && col > 0) {
+            screen[row][col - 1] = Cell.BLANK
+        } else if (!cell.isContinuation && col + 1 < _width && screen[row][col + 1].isContinuation) {
+            screen[row][col + 1] = Cell.BLANK
+        }
+    }
+
+    /**
+     * Advance the cursor by [steps] columns. Wraps to the next line at the
+     * right edge; scrolls the screen up when the cursor moves past the last row.
+     */
+    private fun advanceCursor(steps: Int = 1) {
+        cursorCol += steps
+        while (cursorCol >= _width) {
+            cursorCol -= _width
             cursorRow++
-            if (cursorRow >= height) {
+            if (cursorRow >= _height) {
                 scrollUp()
-                cursorRow = height - 1
+                cursorRow = _height - 1
             }
         }
     }
@@ -223,16 +326,13 @@ class TerminalBuffer(
      * Transfer the top screen line to scrollback (dropping the oldest entry if
      * the scrollback is full), shift all remaining lines up by one, and place a
      * fresh blank line at the bottom.
-     *
-     * The transferred [Line] object is never touched again by the screen, so it
-     * becomes immutable history from this point forward.
      */
     private fun scrollUp() {
         if (maxScrollback > 0) {
             if (scrollback.size >= maxScrollback) scrollback.removeFirst()
-            scrollback.addLast(screen[0])   // ownership transfers to scrollback
+            scrollback.addLast(screen[0])
         }
-        for (i in 0 until height - 1) screen[i] = screen[i + 1]
-        screen[height - 1] = Line(width)
+        for (i in 0 until _height - 1) screen[i] = screen[i + 1]
+        screen[_height - 1] = Line(_width)
     }
 }
