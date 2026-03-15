@@ -6,8 +6,8 @@ package com.terminal
  */
 data class Cell(
     val char: Char = ' ',
-    val fg: Int = 0,
-    val bg: Int = 0,
+    val fg: Color = Color.DEFAULT,
+    val bg: Color = Color.DEFAULT,
     val bold: Boolean = false,
     val italic: Boolean = false,
     val underline: Boolean = false,
