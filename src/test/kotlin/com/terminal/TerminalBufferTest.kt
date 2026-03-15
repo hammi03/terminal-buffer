@@ -445,6 +445,176 @@ class TerminalBufferTest {
         }
     }
 
+    // ── Wide characters ───────────────────────────────────────────────────────
+
+    @Nested inner class WideCharacters {
+
+        // U+4E2D (中) is a CJK ideograph — display width 2
+        private val WIDE = '\u4E2D'
+
+        @Test fun `CharWidth returns 2 for CJK character`() {
+            assertEquals(2, CharWidth.of(WIDE))
+        }
+
+        @Test fun `CharWidth returns 1 for ASCII`() {
+            assertEquals(1, CharWidth.of('A'))
+        }
+
+        @Test fun `wide char occupies two columns — lead cell has char`() {
+            val b = buf(6, 2)
+            b.writeText("$WIDE")
+            assertEquals(WIDE, b.readCell(0, 0).char)
+        }
+
+        @Test fun `wide char occupies two columns — second cell is continuation`() {
+            val b = buf(6, 2)
+            b.writeText("$WIDE")
+            val cont = b.readCell(0, 1)
+            assertTrue(cont.isContinuation)
+            assertEquals(' ', cont.char)
+        }
+
+        @Test fun `cursor advances by 2 after wide char`() {
+            val b = buf(6, 2)
+            b.writeText("$WIDE")
+            assertEquals(0, b.getCursorRow())
+            assertEquals(2, b.getCursorCol())
+        }
+
+        @Test fun `wide char followed by ascii`() {
+            val b = buf(6, 2)
+            b.writeText("${WIDE}A")
+            assertEquals(WIDE, b.readCell(0, 0).char)
+            assertEquals('A',  b.readCell(0, 2).char)
+        }
+
+        @Test fun `wide char at last column wraps and fills last col with blank`() {
+            val b = buf(3, 2)   // width=3; wide char at col 2 won't fit
+            b.setCursor(0, 2)
+            b.writeText("$WIDE")
+            // col 2 should be blank (can't fit half a wide char)
+            assertEquals(' ', b.readCell(0, 2).char)
+            assertFalse(b.readCell(0, 2).isContinuation)
+            // wide char on next line
+            assertEquals(WIDE, b.readCell(1, 0).char)
+            assertTrue(b.readCell(1, 1).isContinuation)
+        }
+
+        @Test fun `overwriting continuation clears lead`() {
+            val b = buf(6, 2)
+            b.writeText("$WIDE")       // cols 0-1
+            b.setCursor(0, 1)
+            b.writeText("X")           // overwrite continuation at col 1
+            // col 0 (old lead) must be cleared to blank
+            assertEquals(' ',  b.readCell(0, 0).char)
+            assertFalse(b.readCell(0, 0).isContinuation)
+            assertEquals('X',  b.readCell(0, 1).char)
+        }
+
+        @Test fun `overwriting lead clears continuation`() {
+            val b = buf(6, 2)
+            b.writeText("$WIDE")       // cols 0-1
+            b.setCursor(0, 0)
+            b.writeText("X")           // overwrite lead at col 0
+            assertEquals('X',  b.readCell(0, 0).char)
+            // col 1 (old continuation) must be cleared
+            assertEquals(' ',  b.readCell(0, 1).char)
+            assertFalse(b.readCell(0, 1).isContinuation)
+        }
+
+        @Test fun `wide chars in insert mode shift content`() {
+            val b = buf(6, 2)
+            b.writeText("AB")          // col 0='A', col 1='B'
+            b.setCursor(0, 0)
+            b.insertText("$WIDE")      // insert wide char before A
+            assertEquals(WIDE, b.readCell(0, 0).char)
+            assertTrue(b.readCell(0, 1).isContinuation)
+            assertEquals('A',  b.readCell(0, 2).char)
+            assertEquals('B',  b.readCell(0, 3).char)
+        }
+
+        @Test fun `multiple wide chars advance cursor correctly`() {
+            val b = buf(8, 2)
+            b.writeText("$WIDE$WIDE$WIDE")
+            assertEquals(0, b.getCursorRow())
+            assertEquals(6, b.getCursorCol())
+        }
+    }
+
+    // ── Resize ────────────────────────────────────────────────────────────────
+
+    @Nested inner class Resize {
+
+        @Test fun `grow width adds blank cells on right`() {
+            val b = buf(3, 2)
+            b.writeText("ABC")
+            b.resize(5, 2)
+            assertEquals(5, b.width)
+            assertEquals("ABC  ", b.readLine(0))
+        }
+
+        @Test fun `shrink width truncates cells`() {
+            val b = buf(5, 2)
+            b.writeText("HELLO")
+            b.resize(3, 2)
+            assertEquals(3, b.width)
+            assertEquals("HEL", b.readLine(0))
+        }
+
+        @Test fun `grow height adds blank rows at bottom`() {
+            val b = buf(3, 2)
+            b.writeText("ABCDEF")
+            b.resize(3, 4)
+            assertEquals(4, b.height)
+            assertEquals("ABC", b.readLine(0))
+            assertEquals("DEF", b.readLine(1))
+            assertEquals("   ", b.readLine(2))
+            assertEquals("   ", b.readLine(3))
+        }
+
+        @Test fun `shrink height pushes top rows into scrollback`() {
+            val b = buf(3, 4)
+            b.writeText("ABCDEFGHIJKL")   // fills all 4 rows
+            b.resize(3, 2)
+            assertEquals(2, b.height)
+            // top 2 rows (ABC, DEF) moved to scrollback
+            assertEquals(2, b.scrollbackSize())
+            assertEquals("ABC", b.readScrollbackLine(0))
+            assertEquals("DEF", b.readScrollbackLine(1))
+            // bottom 2 rows remain visible
+            assertEquals("GHI", b.readLine(0))
+            assertEquals("JKL", b.readLine(1))
+        }
+
+        @Test fun `cursor is clamped after shrink`() {
+            val b = buf(5, 5)
+            b.setCursor(4, 4)
+            b.resize(3, 3)
+            assertTrue(b.getCursorRow() <= 2)
+            assertTrue(b.getCursorCol() <= 2)
+        }
+
+        @Test fun `resize updates width and height properties`() {
+            val b = buf(4, 4)
+            b.resize(7, 3)
+            assertEquals(7, b.width)
+            assertEquals(3, b.height)
+        }
+
+        @Test fun `resize to same dimensions is a no-op`() {
+            val b = buf(3, 2)
+            b.writeText("ABCDEF")
+            b.resize(3, 2)
+            assertEquals("ABC\nDEF", b.readScreen())
+        }
+
+        @Test fun `invalid resize dimensions throw`() {
+            val b = buf()
+            assertThrows(IllegalArgumentException::class.java) { b.resize(0, 5) }
+            assertThrows(IllegalArgumentException::class.java) { b.resize(5, 0) }
+        }
+    }
+
     // ── Screen invariants ─────────────────────────────────────────────────────
 
     @Nested inner class ScreenInvariants {
