@@ -94,20 +94,23 @@ class TerminalBufferTest {
 
         @Test fun `setAttributes updates currentAttributes`() {
             val b = buf()
-            val attrs = TextAttributes(fg = 1, bg = 2, bold = true)
+            val attrs = TextAttributes(fg = Color.RED, bg = Color.BLUE, bold = true)
             b.setAttributes(attrs)
             assertEquals(attrs, b.currentAttributes)
         }
 
         @Test fun `attributes are captured into cell at write time`() {
             val b = buf()
-            val attrs = TextAttributes(fg = 7, bg = 3, bold = true, italic = true, underline = true)
+            val attrs = TextAttributes(
+                fg = Color.GREEN, bg = Color.YELLOW,
+                bold = true, italic = true, underline = true,
+            )
             b.setAttributes(attrs)
             b.writeText("X")
             val cell = b.readCell(0, 0)
-            assertEquals('X', cell.char)
-            assertEquals(7,    cell.fg)
-            assertEquals(3,    cell.bg)
+            assertEquals('X',          cell.char)
+            assertEquals(Color.GREEN,  cell.fg)
+            assertEquals(Color.YELLOW, cell.bg)
             assertTrue(cell.bold)
             assertTrue(cell.italic)
             assertTrue(cell.underline)
@@ -115,10 +118,16 @@ class TerminalBufferTest {
 
         @Test fun `changing attributes after write does not affect existing cells`() {
             val b = buf()
-            b.setAttributes(TextAttributes(fg = 5))
+            b.setAttributes(TextAttributes(fg = Color.CYAN))
             b.writeText("A")
-            b.setAttributes(TextAttributes(fg = 9))
-            assertEquals(5, b.readCell(0, 0).fg)
+            b.setAttributes(TextAttributes(fg = Color.RED))
+            assertEquals(Color.CYAN, b.readCell(0, 0).fg)
+        }
+
+        @Test fun `default attributes produce blank cell`() {
+            val b = buf()
+            b.writeText(" ")
+            assertEquals(Cell.BLANK, b.readCell(0, 0))
         }
     }
 
@@ -157,9 +166,9 @@ class TerminalBufferTest {
 
         @Test fun `scrolls up when writing past last row`() {
             val b = buf(3, 2)
-            b.writeText("ABCDEF")  // fills both rows exactly
+            b.writeText("ABCDEF")    // fills both rows exactly
             assertEquals("ABC\nDEF", b.readScreen())
-            b.writeText("G")       // triggers scroll
+            b.writeText("G")         // triggers scroll
             assertEquals("DEF\nG  ", b.readScreen())
         }
 
@@ -185,18 +194,18 @@ class TerminalBufferTest {
 
         @Test fun `overflow cascades to next line`() {
             val b = buf(3, 3)
-            b.writeText("ABCDE")   // row0="ABC", row1="DE "
+            b.writeText("ABCDE")    // row0="ABC", row1="DE "
             b.setCursor(0, 0)
-            b.insertText("X")      // row0="XAB", overflow 'C' -> row1 col0
+            b.insertText("X")       // row0="XAB", overflow 'C' -> row1 col0
             assertEquals("XAB", b.readLine(0))
             assertEquals("CDE", b.readLine(1))
         }
 
         @Test fun `overflow past last line is discarded`() {
             val b = buf(3, 2)
-            b.writeText("ABCDEF")  // row0="ABC", row1="DEF"
+            b.writeText("ABCDEF")   // row0="ABC", row1="DEF"
             b.setCursor(0, 0)
-            b.insertText("X")      // 'F' at end of last line is lost
+            b.insertText("X")       // 'F' at end of last line is lost
             assertEquals("XAB", b.readLine(0))
             assertEquals("CDE", b.readLine(1))
         }
@@ -228,17 +237,17 @@ class TerminalBufferTest {
 
         @Test fun `fill uses currentAttributes`() {
             val b = buf(3, 2)
-            b.setAttributes(TextAttributes(fg = 4, bold = true))
+            b.setAttributes(TextAttributes(fg = Color.MAGENTA, bold = true))
             b.fillLine(0, 'X')
             val cell = b.readCell(0, 0)
-            assertEquals('X', cell.char)
-            assertEquals(4, cell.fg)
+            assertEquals('X',           cell.char)
+            assertEquals(Color.MAGENTA, cell.fg)
             assertTrue(cell.bold)
         }
 
         @Test fun `row is clamped`() {
             val b = buf(3, 3)
-            b.fillLine(99, 'X')   // should not throw; clamps to row 2
+            b.fillLine(99, 'X')    // clamps to row 2
             assertEquals("XXX", b.readLine(2))
         }
     }
@@ -292,7 +301,7 @@ class TerminalBufferTest {
 
         @Test fun `preserves scrollback`() {
             val b = buf(3, 2)
-            b.writeText("ABCDEFG")  // one line scrolls off
+            b.writeText("ABCDEFG")
             val sbSize = b.scrollbackSize()
             b.clearScreen()
             assertEquals(sbSize, b.scrollbackSize())
@@ -312,18 +321,18 @@ class TerminalBufferTest {
         }
     }
 
-    // ── Read operations ───────────────────────────────────────────────────────
+    // ── Read — screen ─────────────────────────────────────────────────────────
 
-    @Nested inner class ReadOperations {
+    @Nested inner class ReadScreen {
 
         @Test fun `readCell returns correct cell`() {
             val b = buf(5, 3)
-            b.setAttributes(TextAttributes(fg = 2))
+            b.setAttributes(TextAttributes(fg = Color.BLUE))
             b.setCursor(1, 3)
             b.writeText("Z")
             val cell = b.readCell(1, 3)
-            assertEquals('Z', cell.char)
-            assertEquals(2, cell.fg)
+            assertEquals('Z',        cell.char)
+            assertEquals(Color.BLUE, cell.fg)
         }
 
         @Test fun `readLine returns line as string`() {
@@ -337,22 +346,74 @@ class TerminalBufferTest {
             b.writeText("ABCDEF")
             assertEquals("ABC\nDEF", b.readScreen())
         }
+    }
+
+    // ── Read — scrollback ─────────────────────────────────────────────────────
+
+    @Nested inner class ReadScrollback {
+
+        @Test fun `readScrollbackLine returns scrolled-off content`() {
+            val b = buf(3, 2)
+            b.writeText("ABCDEFG")   // "ABC" scrolls off
+            assertEquals("ABC", b.readScrollbackLine(0))
+        }
+
+        @Test fun `readScrollbackCell returns correct cell and attributes`() {
+            val b = buf(3, 2)
+            b.setAttributes(TextAttributes(fg = Color.RED))
+            b.writeText("ABC")
+            b.setAttributes(TextAttributes())
+            b.insertLineAtBottom()   // "ABC" -> scrollback
+            val cell = b.readScrollbackCell(0, 1)
+            assertEquals('B',       cell.char)
+            assertEquals(Color.RED, cell.fg)
+        }
 
         @Test fun `readAll prepends scrollback to screen`() {
             val b = buf(3, 2)
             b.writeText("ABCDEFG")   // "ABC" scrolls off
-            val all = b.readAll()
-            assertEquals("ABC\nDEF\nG  ", all)
+            assertEquals("ABC\nDEF\nG  ", b.readAll())
         }
     }
 
-    // ── Scrollback ────────────────────────────────────────────────────────────
+    // ── Read — global coordinate space ────────────────────────────────────────
+
+    @Nested inner class ReadGlobal {
+
+        @Test fun `totalLines equals scrollbackSize plus height`() {
+            val b = buf(3, 2)
+            b.writeText("ABCDEFG")
+            assertEquals(b.scrollbackSize() + b.height, b.totalLines)
+        }
+
+        @Test fun `readGlobalLine addresses scrollback rows first`() {
+            val b = buf(3, 2)
+            b.writeText("ABCDEFG")   // scrollback=["ABC"], screen=["DEF","G  "]
+            assertEquals("ABC", b.readGlobalLine(0))
+            assertEquals("DEF", b.readGlobalLine(1))
+            assertEquals("G  ", b.readGlobalLine(2))
+        }
+
+        @Test fun `readGlobalCell returns correct cell in scrollback`() {
+            val b = buf(3, 2)
+            b.writeText("ABCDEFG")
+            assertEquals('B', b.readGlobalCell(0, 1).char)
+        }
+
+        @Test fun `readGlobalCell returns correct cell in screen`() {
+            val b = buf(3, 2)
+            b.writeText("ABCDEFG")
+            assertEquals('E', b.readGlobalCell(1, 1).char)
+        }
+    }
+
+    // ── Scrollback bounds ─────────────────────────────────────────────────────
 
     @Nested inner class Scrollback {
 
         @Test fun `bounded scrollback drops oldest line`() {
             val b = TerminalBuffer(3, 2, maxScrollback = 2)
-            b.writeText("ABCDEFGHIJKLMNO")  // many scrolls
+            b.writeText("ABCDEFGHIJKLMNO")
             assertEquals(2, b.scrollbackSize())
         }
 
@@ -362,26 +423,23 @@ class TerminalBufferTest {
             assertEquals(0, b.scrollbackSize())
         }
 
-        @Test fun `scrollback line is immutable history — screen writes do not affect it`() {
+        @Test fun `scrollback line is immutable history`() {
             val b = buf(3, 2)
-            b.writeText("ABC")          // row 0 = "ABC"
-            b.insertLineAtBottom()      // "ABC" moves to scrollback
+            b.writeText("ABC")
+            b.insertLineAtBottom()
             b.setCursor(0, 0)
-            b.writeText("XYZ")          // overwrite screen row 0
-            // scrollback must still hold original "ABC"
-            val all = b.readAll()
-            assertTrue(all.startsWith("ABC"), "scrollback was mutated: $all")
+            b.writeText("XYZ")
+            assertTrue(b.readAll().startsWith("ABC"), "scrollback was mutated")
         }
 
         @Test fun `scrollback order is oldest-first`() {
             val b = buf(3, 2)
             b.writeText("AAA")
-            b.insertLineAtBottom()   // "AAA" -> scrollback[0]
+            b.insertLineAtBottom()
             b.setCursor(0, 0)
             b.writeText("BBB")
-            b.insertLineAtBottom()   // "BBB" -> scrollback[1]
-            val all = b.readAll()
-            val lines = all.split("\n")
+            b.insertLineAtBottom()
+            val lines = b.readAll().split("\n")
             assertEquals("AAA", lines[0])
             assertEquals("BBB", lines[1])
         }
@@ -394,7 +452,7 @@ class TerminalBufferTest {
         @Test fun `screen always has exactly height lines`() {
             val b = buf(3, 4)
             repeat(20) { b.writeText("X") }
-            assertEquals(3, b.readScreen().split("\n").size)
+            assertEquals(4, b.readScreen().split("\n").size)
         }
 
         @Test fun `every line always has exactly width cells`() {
